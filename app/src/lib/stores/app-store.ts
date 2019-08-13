@@ -184,7 +184,11 @@ import {
   hasSeenUsageStatsNote,
 } from '../stats'
 import { hasShownWelcomeFlow, markWelcomeFlowComplete } from '../welcome'
-import { getWindowState, WindowState } from '../window-state'
+import {
+  getWindowState,
+  WindowState,
+  windowStateChannelName,
+} from '../window-state'
 import { TypedBaseStore } from './base-store'
 import { AheadBehindUpdater } from './helpers/ahead-behind-updater'
 import { MergeResult } from '../../models/merge'
@@ -212,10 +216,11 @@ import {
 import { BranchPruner } from './helpers/branch-pruner'
 import {
   enableBranchPruning,
-  enablePullWithRebase,
   enableGroupRepositoriesByOwner,
   enableStashing,
-  enableBranchProtectionWarning,
+  enableBranchProtectionChecks,
+  enableBranchProtectionWarningFlow,
+  enableHideWhitespaceInDiffOption,
 } from '../feature-flag'
 import { Banner, BannerType } from '../../models/banner'
 import * as moment from 'moment'
@@ -275,6 +280,9 @@ const externalEditorKey: string = 'externalEditor'
 
 const imageDiffTypeDefault = ImageDiffType.TwoUp
 const imageDiffTypeKey = 'image-diff-type'
+
+const hideWhitespaceInDiffDefault = false
+const hideWhitespaceInDiffKey = 'hide-whitespace-in-diff'
 
 const shellKey = 'shell'
 
@@ -349,6 +357,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
   private confirmDiscardChanges: boolean = confirmDiscardChangesDefault
   private askForConfirmationOnForcePush = askForConfirmationOnForcePushDefault
   private imageDiffType: ImageDiffType = imageDiffTypeDefault
+  private hideWhitespaceInDiff: boolean = hideWhitespaceInDiffDefault
 
   private selectedExternalEditor?: ExternalEditor
 
@@ -401,9 +410,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     const window = remote.getCurrentWindow()
     this.windowState = getWindowState(window)
 
-    window.webContents.getZoomFactor(factor => {
-      this.onWindowZoomFactorChanged(factor)
-    })
+    this.onWindowZoomFactorChanged(window.webContents.getZoomFactor())
 
     this.wireupIpcEventHandlers(window)
     this.wireupStoreEventHandlers()
@@ -412,9 +419,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
   private wireupIpcEventHandlers(window: Electron.BrowserWindow) {
     ipcRenderer.on(
-      'window-state-changed',
-      (event: Electron.IpcMessageEvent, args: any[]) => {
-        this.windowState = getWindowState(window)
+      windowStateChannelName,
+      (event: Electron.IpcMessageEvent, windowState: WindowState) => {
+        this.windowState = windowState
         this.emitUpdate()
       }
     )
@@ -611,6 +618,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       askForConfirmationOnForcePush: this.askForConfirmationOnForcePush,
       selectedExternalEditor: this.selectedExternalEditor,
       imageDiffType: this.imageDiffType,
+      hideWhitespaceInDiff: this.hideWhitespaceInDiff,
       selectedShell: this.selectedShell,
       repositoryFilterText: this.repositoryFilterText,
       resolvedExternalEditor: this.resolvedExternalEditor,
@@ -720,6 +728,35 @@ export class AppStore extends TypedBaseStore<IAppState> {
       this._selectStashedFile(repository)
     } else {
       this.emitUpdate()
+    }
+  }
+
+  private async refreshBranchProtectionState(repository: Repository) {
+    if (!enableBranchProtectionWarningFlow()) {
+      return
+    }
+
+    const gitStore = this.gitStoreCache.get(repository)
+
+    if (
+      gitStore.tip.kind === TipState.Valid &&
+      repository.gitHubRepository !== null
+    ) {
+      const branchName = findRemoteBranchName(
+        gitStore.tip,
+        gitStore.currentRemote,
+        repository.gitHubRepository
+      )
+
+      if (branchName !== null) {
+        const currentBranchProtected = await this.repositoriesStore.isBranchProtectedOnRemote(
+          repository.gitHubRepository,
+          branchName
+        )
+        this.repositoryStateCache.updateChangesState(repository, () => ({
+          currentBranchProtected,
+        }))
+      }
     }
   }
 
@@ -1222,7 +1259,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
       }
     }
 
-    const diff = await getCommitDiff(repository, file, sha)
+    const diff = await getCommitDiff(
+      repository,
+      file,
+      sha,
+      enableHideWhitespaceInDiffOption() ? this.hideWhitespaceInDiff : false
+    )
 
     const stateAfterLoad = this.repositoryStateCache.get(repository)
 
@@ -1627,6 +1669,8 @@ export class AppStore extends TypedBaseStore<IAppState> {
         ? imageDiffTypeDefault
         : parseInt(imageDiffTypeValue)
 
+    this.hideWhitespaceInDiff = getBoolean(hideWhitespaceInDiffKey, false)
+
     this.automaticallySwitchTheme = getAutoSwitchPersistedTheme()
 
     if (this.automaticallySwitchTheme) {
@@ -1850,24 +1894,20 @@ export class AppStore extends TypedBaseStore<IAppState> {
   }
 
   private async _triggerConflictsFlow(repository: Repository) {
-    if (enablePullWithRebase()) {
-      const state = this.repositoryStateCache.get(repository)
-      const { conflictState } = state.changesState
+    const state = this.repositoryStateCache.get(repository)
+    const { conflictState } = state.changesState
 
-      if (conflictState === null) {
-        this.clearConflictsFlowVisuals(state)
-        return
-      }
+    if (conflictState === null) {
+      this.clearConflictsFlowVisuals(state)
+      return
+    }
 
-      if (conflictState.kind === 'merge') {
-        await this.showMergeConflictsDialog(repository, conflictState)
-      } else if (conflictState.kind === 'rebase') {
-        await this.showRebaseConflictsDialog(repository, conflictState)
-      } else {
-        assertNever(conflictState, `Unsupported conflict kind`)
-      }
+    if (conflictState.kind === 'merge') {
+      await this.showMergeConflictsDialog(repository, conflictState)
+    } else if (conflictState.kind === 'rebase') {
+      await this.showRebaseConflictsDialog(repository, conflictState)
     } else {
-      this._triggerMergeConflictsFlow(repository)
+      assertNever(conflictState, `Unsupported conflict kind`)
     }
   }
 
@@ -1939,51 +1979,6 @@ export class AppStore extends TypedBaseStore<IAppState> {
       this.currentBanner.type === BannerType.MergeConflictsFound
 
     if (alreadyInFlow || alreadyExitedFlow) {
-      return
-    }
-
-    const possibleTheirsBranches = await getBranchesPointedAt(
-      repository,
-      'MERGE_HEAD'
-    )
-    // null means we encountered an error
-    if (possibleTheirsBranches === null) {
-      return
-    }
-    const theirBranch =
-      possibleTheirsBranches.length === 1
-        ? possibleTheirsBranches[0]
-        : undefined
-
-    const ourBranch = conflictState.currentBranch
-    this._showPopup({
-      type: PopupType.MergeConflicts,
-      repository,
-      ourBranch,
-      theirBranch,
-    })
-  }
-
-  /** starts the conflict resolution flow, if appropriate */
-  private async _triggerMergeConflictsFlow(repository: Repository) {
-    // are we already in the merge conflicts flow?
-    const alreadyInFlow =
-      this.currentPopup !== null &&
-      (this.currentPopup.type === PopupType.MergeConflicts ||
-        this.currentPopup.type === PopupType.AbortMerge)
-
-    // have we already been shown the merge conflicts flow *and closed it*?
-    const alreadyExitedFlow =
-      this.currentBanner !== null &&
-      this.currentBanner.type === BannerType.MergeConflictsFound
-
-    if (alreadyInFlow || alreadyExitedFlow) {
-      return
-    }
-
-    const repoState = this.repositoryStateCache.get(repository)
-    const { conflictState } = repoState.changesState
-    if (conflictState === null || !isMergeConflictState(conflictState)) {
       return
     }
 
@@ -2384,7 +2379,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
           }
         }
 
-        if (enableBranchProtectionWarning()) {
+        if (enableBranchProtectionChecks()) {
           const branchProtectionsFound = await this.repositoriesStore.hasBranchProtectionsConfigured(
             repository.gitHubRepository
           )
@@ -2567,6 +2562,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       gitStore.updateLastFetched(),
       gitStore.loadStashEntries(),
       this.refreshAuthor(repository),
+      this.refreshBranchProtectionState(repository),
       refreshSectionPromise,
     ])
 
@@ -2858,7 +2854,11 @@ export class AppStore extends TypedBaseStore<IAppState> {
       return repository
     }
 
-    const repo = await this._checkoutBranch(repository, branch)
+    const repo = await this._checkoutBranch(
+      repository,
+      branch,
+      uncommittedChangesStrategy
+    )
     this._closePopup()
     return repo
   }
@@ -3112,15 +3112,45 @@ export class AppStore extends TypedBaseStore<IAppState> {
       return repository
     }
 
-    const branches = enableBranchProtectionWarning()
-      ? await api.fetchProtectedBranches(owner, name)
-      : new Array<IAPIBranch>()
-
     const endpoint = matchedGitHubRepository.endpoint
-    return this.repositoriesStore.updateGitHubRepository(
+    const updatedRepository = await this.repositoriesStore.updateGitHubRepository(
       repository,
       endpoint,
-      apiRepo,
+      apiRepo
+    )
+
+    await this.updateBranchProtectionsFromAPI(repository)
+
+    return updatedRepository
+  }
+
+  private async updateBranchProtectionsFromAPI(repository: Repository) {
+    if (
+      repository.gitHubRepository === null ||
+      repository.gitHubRepository.dbID === null
+    ) {
+      return
+    }
+
+    const { owner, name } = repository.gitHubRepository
+
+    const account = getAccountForEndpoint(
+      this.accounts,
+      repository.gitHubRepository.endpoint
+    )
+
+    if (account === null) {
+      return
+    }
+
+    const api = API.fromAccount(account)
+
+    const branches = enableBranchProtectionChecks()
+      ? await api.fetchProtectedBranches(owner.login, name)
+      : new Array<IAPIBranch>()
+
+    await this.repositoriesStore.updateBranchProtections(
+      repository.gitHubRepository,
       branches
     )
   }
@@ -3323,6 +3353,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
               value: refreshStartProgress,
             })
 
+            // manually refresh branch protections after the push, to ensure
+            // any new branch will immediately report as protected
+            await this.updateBranchProtectionsFromAPI(repository)
+
             await this._refreshRepository(repository)
 
             this.updatePushPullFetchProgress(repository, {
@@ -3515,6 +3549,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
             await gitStore.reconcileHistory(mergeBase)
           }
 
+          // manually refresh branch protections after the push, to ensure
+          // any new branch will immediately report as protected
+          await this.updateBranchProtectionsFromAPI(repository)
+
           await this._refreshRepository(repository)
 
           this.updatePushPullFetchProgress(repository, {
@@ -3555,7 +3593,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       eligibleBranches =
         defaultBranch != null &&
         eligibleForFastForward(defaultBranch, currentBranchName)
-          ? [defaultBranch]
+          ? [defaultBranch, ...state.branchesState.recentBranches]
           : []
     }
 
@@ -3812,6 +3850,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
           title: refreshTitle,
           value: fetchWeight,
         })
+
+        // manually refresh branch protections after the push, to ensure
+        // any new branch will immediately report as protected
+        await this.updateBranchProtectionsFromAPI(repository)
 
         await this._refreshRepository(repository)
 
@@ -4275,6 +4317,21 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.emitUpdate()
 
     return Promise.resolve()
+  }
+
+  public _setHideWhitespaceInDiff(
+    hideWhitespaceInDiff: boolean,
+    repository: Repository,
+    file: CommittedFileChange | null
+  ): Promise<void> {
+    setBoolean(hideWhitespaceInDiffKey, hideWhitespaceInDiff)
+    this.hideWhitespaceInDiff = hideWhitespaceInDiff
+
+    if (file === null) {
+      return this.updateChangesWorkingDirectoryDiff(repository)
+    } else {
+      return this._changeFileSelection(repository, file)
+    }
   }
 
   public _setUpdateBannerVisibility(visibility: boolean) {
